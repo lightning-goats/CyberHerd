@@ -9,6 +9,8 @@ import signal
 from datetime import datetime
 from typing import Optional, Dict, Any, Set
 
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -26,6 +28,22 @@ config = {
 http_client = httpx.AsyncClient(http2=True, limits=httpx.Limits(max_keepalive_connections=10, max_connections=20))
 
 
+async def run_subprocess(command: list, timeout: int = 30) -> subprocess.CompletedProcess:
+    """Run a subprocess asynchronously with a timeout."""
+    proc = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        return subprocess.CompletedProcess(args=command, returncode=proc.returncode, stdout=stdout, stderr=stderr)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.communicate()
+        raise asyncio.TimeoutError(f"Subprocess '{' '.join(command)}' timed out after {timeout} seconds.")
+
+
 class Utils:
     @staticmethod
     def calculate_midnight() -> int:
@@ -39,13 +57,15 @@ class Utils:
         """Decode bolt11 field using lnbits API."""
         url = 'https://lnb.bolverker.com/api/v1/payments/decode'
         try:
-            response = await http_client.post(url, headers={"Content-Type": "application/json"}, json={"data": bolt11})
-            response.raise_for_status()
+            response = await send_with_retry(http_client.post, url, headers={"Content-Type": "application/json"}, json={"data": bolt11})
             data = response.json()
             logger.debug(f"Bolt11 decode: {data}")
             return data
         except httpx.RequestError as e:
             logger.error(f"Failed to decode bolt11: {e}")
+            return None
+        except httpx.HTTPStatusError as e:
+            logger.error(f"HTTP error during bolt11 decode: {e}")
             return None
 
 
@@ -61,7 +81,7 @@ class Verifier:
         url = f'https://{domain}/.well-known/lnurlp/{user}'
 
         try:
-            response = await http_client.get(url)
+            response = await send_with_retry(http_client.get, url)
             response.raise_for_status()
             data = response.json()
             logger.debug(f"LUD-16 validation response: {data}")
@@ -78,17 +98,24 @@ class Verifier:
         return False
 
     @staticmethod
-    def verify_nip05(nip05: str) -> bool:
-        """Verify a NIP-05 identifier using nak decode."""
+    async def verify_nip05(nip05: str) -> bool:
+        """Asynchronously verify a NIP-05 identifier using nak decode."""
         decode_command = ['/usr/local/bin/nak', 'decode', nip05]
         try:
-            decode_result = subprocess.run(decode_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
-            decoded_data = json.loads(decode_result.stdout)
+            result = await run_subprocess(decode_command, timeout=10)
+            if result.returncode != 0:
+                logger.error(f"Error decoding nip05: {result.stderr.decode().strip()}")
+                return False
+
+            decoded_data = json.loads(result.stdout.decode())
             return True if decoded_data.get('pubkey') else False
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Error decoding nip05: {e}")
+
+        except asyncio.TimeoutError as e:
+            logger.error(e)
         except json.JSONDecodeError as e:
             logger.error(f"Error parsing decoded nip05: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error during nip05 verification: {e}")
         return False
 
 
@@ -97,8 +124,14 @@ class EventProcessor:
         self.seen_ids = set()
         self.json_objects = []
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type(httpx.RequestError) | retry_if_exception_type(httpx.HTTPStatusError),
+        reraise=True
+    )
     async def send_json_payload(self, json_objects: list, webhook_url: str) -> bool:
-        """Send JSON payload to the specified webhook URL."""
+        """Send JSON payload to the specified webhook URL with retry logic."""
         if json_objects:
             try:
                 logger.debug(f"Sending JSON payload: {json_objects}")
@@ -107,30 +140,34 @@ class EventProcessor:
                 logger.info(f"Data sent successfully. Response: {response.text}")
                 self.json_objects.clear()  # Clear the list after successful send
                 return True
-            except httpx.HTTPStatusError as e:
-                logger.error(f"HTTP error occurred: {e.response.status_code} - {e.response.text}")
-            except httpx.RequestError as e:
-                logger.error(f"Request error occurred: {e}")
+            except (httpx.HTTPStatusError, httpx.RequestError) as e:
+                logger.error(f"HTTP error occurred: {e}")
+                raise  # Propagate exception to trigger retry
         else:
             logger.warning("No JSON objects to send.")
         return False
 
-
-    def lookup_metadata(self, pubkey: str) -> Optional[Dict[str, Optional[str]]]:
-        """Lookup metadata for the given pubkey."""
+    async def lookup_metadata(self, pubkey: str) -> Optional[Dict[str, Optional[str]]]:
+        """Asynchronously lookup metadata for the given pubkey."""
         logger.debug(f"Looking up metadata for pubkey: {pubkey}")
         metadata_command = ['/usr/local/bin/nak', 'req', '-k', '0', '-a', pubkey] + relays
         try:
-            metadata_result = subprocess.run(metadata_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+            result = await run_subprocess(metadata_command, timeout=15)
+            if result.returncode != 0:
+                logger.error(f"Error fetching metadata: {result.stderr.decode().strip()}")
+                return None
 
             last_meta_data = None
 
-            for meta_line in metadata_result.stdout.splitlines():
-                meta_data = json.loads(meta_line)
-                content = json.loads(meta_data.get('content', '{}'))
-                if content.get('lud16'):
-                    if (last_meta_data is None) or (meta_data['created_at'] > last_meta_data['created_at']):
-                        last_meta_data = meta_data
+            for meta_line in result.stdout.decode().splitlines():
+                try:
+                    meta_data = json.loads(meta_line)
+                    content = json.loads(meta_data.get('content', '{}'))
+                    if content.get('lud16'):
+                        if (last_meta_data is None) or (meta_data['created_at'] > last_meta_data['created_at']):
+                            last_meta_data = meta_data
+                except json.JSONDecodeError as e:
+                    logger.error(f"Error parsing metadata line: {e}")
 
             if last_meta_data:
                 content = json.loads(last_meta_data.get('content', '{}'))
@@ -142,8 +179,10 @@ class EventProcessor:
             else:
                 logger.warning(f"No metadata found for pubkey: {pubkey}")
 
-        except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
-            logger.error(f"Failed to get or parse metadata for pubkey {pubkey}: {e}")
+        except asyncio.TimeoutError:
+            logger.error("Timeout while fetching metadata.")
+        except Exception as e:
+            logger.error(f"Unexpected error during metadata lookup: {e}")
 
         return None
 
@@ -167,7 +206,7 @@ class EventProcessor:
         logger.info(f"Handling event: event_id={note}, pubkey={pubkey}, kind={kind}, amount={amount}")
 
         if pubkey != HEX_KEY:
-            metadata = self.lookup_metadata(pubkey)
+            metadata = await self.lookup_metadata(pubkey)
             if metadata:
                 lud16 = metadata['lud16']
                 display_name = metadata['display_name']
@@ -175,8 +214,12 @@ class EventProcessor:
                 if lud16:
                     nprofile_command = ['/usr/local/bin/nak', 'encode', 'nprofile', pubkey]
                     try:
-                        nprofile_result = subprocess.run(nprofile_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
-                        nprofile = nprofile_result.stdout.strip()
+                        result = await run_subprocess(nprofile_command, timeout=10)
+                        if result.returncode != 0:
+                            logger.error(f"Error encoding nprofile: {result.stderr.decode().strip()}")
+                            return
+
+                        nprofile = result.stdout.decode().strip()
                         logger.debug(f"Metadata lookup success: {metadata}")
 
                         # Adjust kind and payouts based on event type
@@ -196,7 +239,7 @@ class EventProcessor:
                             "pubkey": pubkey,              # str
                             "nprofile": nprofile,          # str
                             "lud16": lud16,                # str
-                            "notified": 'False',           #str 
+                            "notified": 'False',           # str 
                             "payouts": payouts              # float
                         }
 
@@ -204,14 +247,17 @@ class EventProcessor:
                         logger.debug(f"Appending json object: {json_object}")
                         await self.send_json_payload(self.json_objects, WEBHOOK_URL)
 
-                    except subprocess.CalledProcessError as e:
-                        logger.error(f"Failed to encode nprofile for pubkey {pubkey}: {e}")
+                    except asyncio.TimeoutError as e:
+                        logger.error(e)
+                    except Exception as e:
+                        logger.error(f"Unexpected error during nprofile encoding: {e}")
                 else:
                     logger.warning(f"Missing lud16 for pubkey {pubkey}. Skipping event.")
             else:
                 logger.warning(f"No metadata found for pubkey {pubkey}. Skipping event.")
         else:
             logger.debug(f"Pubkey matches HEX_KEY ({HEX_KEY}), skipping event.")
+
 
 class Monitor:
     def __init__(self, event_processor: EventProcessor):
@@ -221,7 +267,7 @@ class Monitor:
 
     async def execute_subprocess(self, id_output: str, created_at_output: str) -> None:
         """Execute a subprocess to process events asynchronously."""
-        command = f"/usr/local/bin/nak req --stream -k 6 -k 9735 -e {id_output} --since {created_at_output} " + ' '.join(relays)
+        command = f"/usr/local/bin/nak req --stream -k 6 -e {id_output} --since {created_at_output} " + ' '.join(relays)
         proc = await asyncio.create_subprocess_shell(command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         self.active_subprocesses.add(proc)
         logger.info(f"Subprocess started with PID: {proc.pid}")
@@ -330,6 +376,23 @@ class Monitor:
         logger.info("Monitor shutdown complete.")
 
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type(httpx.RequestError) | retry_if_exception_type(httpx.HTTPStatusError),
+    reraise=True
+)
+async def send_with_retry(func, *args, **kwargs):
+    """Helper function to send HTTP requests with retry logic."""
+    try:
+        response = await func(*args, **kwargs)
+        response.raise_for_status()
+        return response
+    except (httpx.RequestError, httpx.HTTPStatusError) as e:
+        logger.error(f"HTTP request failed: {e}")
+        raise
+
+
 async def main():
     event_processor = EventProcessor()
     monitor = Monitor(event_processor)
@@ -343,8 +406,12 @@ async def main():
         logger.info("Shutdown signal received.")
         stop_event.set()
 
-    loop.add_signal_handler(signal.SIGINT, _signal_handler)
-    loop.add_signal_handler(signal.SIGTERM, _signal_handler)
+    try:
+        loop.add_signal_handler(signal.SIGINT, _signal_handler)
+        loop.add_signal_handler(signal.SIGTERM, _signal_handler)
+    except NotImplementedError:
+        # Signal handling might not be implemented on some platforms (e.g., Windows)
+        logger.warning("Signal handlers are not implemented on this platform.")
 
     try:
         notes_task = asyncio.create_task(monitor.monitor_new_notes())
