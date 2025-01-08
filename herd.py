@@ -9,7 +9,7 @@ import signal
 from datetime import datetime
 from typing import Optional, Dict, Any, Set
 
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+# Removed tenacity imports
 
 from cyberherd_module import (
     run_subprocess,
@@ -68,28 +68,6 @@ class Utils:
         midnight = datetime.combine(now.date(), datetime.min.time())
         return int(midnight.timestamp())
 
-    @staticmethod
-    async def decode_bolt11(bolt11: str) -> Optional[Dict[str, Any]]:
-        """Decode bolt11 field using lnbits API."""
-        url = 'https://lnb.bolverker.com/api/v1/payments/decode'
-        try:
-            async with http_semaphore:
-                response = await send_with_retry(
-                    http_client.post,
-                    url,
-                    headers={"Content-Type": "application/json"},
-                    json={"data": bolt11}
-                )
-            data = response.json()
-            logger.debug(f"Bolt11 decode: {data}")
-            return data
-        except httpx.RequestError as e:
-            logger.error(f"Failed to decode bolt11: {e}")
-            return None
-        except httpx.HTTPStatusError as e:
-            logger.error(f"HTTP error during bolt11 decode: {e}")
-            return None
-
 # -----------------------------------
 # Event Processor Class
 # -----------------------------------
@@ -104,14 +82,11 @@ class EventProcessor:
         # Use the MetadataFetcher from cyberherd_module
         self.metadata_fetcher = MetadataFetcher()
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_exception_type(httpx.RequestError) | retry_if_exception_type(httpx.HTTPStatusError),
-        reraise=True
-    )
     async def send_json_payload(self, json_objects: list, webhook_url: str) -> bool:
-        """Send JSON payload to the specified webhook URL with retry logic."""
+        """
+        Send JSON payload to the specified webhook URL with a single attempt.
+        No retries.
+        """
         if json_objects:
             try:
                 async with self.http_semaphore:
@@ -122,8 +97,8 @@ class EventProcessor:
                 self.json_objects.clear()  # Clear the list after successful send
                 return True
             except (httpx.HTTPStatusError, httpx.RequestError) as e:
-                logger.error(f"HTTP error occurred: {e}")
-                raise  # Propagate exception to trigger retry
+                logger.error(f"HTTP error occurred (no retries): {e}")
+                return False
         else:
             logger.warning("No JSON objects to send.")
         return False
@@ -131,7 +106,7 @@ class EventProcessor:
     async def handle_event(self, data: Dict[str, Any]) -> None:
         """
         Handle individual events based on their kind.
-        Only kind 6 (Repost) logic is retained.
+        Only kind 6 (Repost) currently.
         """
         try:
             event_id = data.get('cyberherd_id')
@@ -211,7 +186,8 @@ class EventProcessor:
                     "nprofile": nprofile,
                     "lud16": lud16,
                     "notified": 'False',
-                    "payouts": payouts
+                    "payouts": payouts,
+                    "amount": amount
                 }
 
                 self.json_objects.append(json_object)
@@ -329,7 +305,8 @@ class Monitor:
                             # Ensure that exceptions in execute_subprocess do not propagate
                             task = asyncio.create_task(self.execute_subprocess(id_output, created_at_output))
                             task.add_done_callback(
-                                lambda t: logger.error(f"Subprocess task error: {t.exception()}") if t.exception() else None
+                                lambda t: logger.error(f"Subprocess task error: {t.exception()}")
+                                if t.exception() else None
                             )
 
                     except json.JSONDecodeError as e:
@@ -360,22 +337,7 @@ class Monitor:
 # Helper Functions
 # -----------------------------------
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=2, max=10),
-    retry=retry_if_exception_type(httpx.RequestError) | retry_if_exception_type(httpx.HTTPStatusError),
-    reraise=True
-)
-async def send_with_retry(func, *args, **kwargs):
-    """Helper function to send HTTP requests with retry logic."""
-    async with http_semaphore:
-        try:
-            response = await func(*args, **kwargs)
-            response.raise_for_status()
-            return response
-        except (httpx.RequestError, httpx.HTTPStatusError) as e:
-            logger.error(f"HTTP request failed: {e}")
-            raise
+# Removed the send_with_retry function and any @retry decorators
 
 # -----------------------------------
 # Main Function
