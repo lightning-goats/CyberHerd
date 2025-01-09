@@ -23,10 +23,10 @@ from cyberherd_module import (
 # -----------------------------------
 
 # Toggle NIP-05 Verification
-ENABLE_NIP05_VERIFICATION = True  # Set to False to disable NIP-05 verification
+NIP05_VERIFICATION = True  # Set to False to disable NIP-05 verification
 
 # Other Configuration Variables
-relays = ["wss://relay.damus.io/" "wss://relay.primal.net/" "wss://relay.nostr.band/"]
+relays = ["wss://relay.damus.io/", "wss://relay.primal.net/", "wss://relay.nostr.band/"]
 WEBHOOK_URL = "http://127.0.0.1:8090/cyber_herd"
 HEX_KEY = "669ebbcccf409ee0467a33660ae88fd17e5379e646e41d7c236ff4963f3c36b6"
 TAGS = ["#CyberHerd", "CyberHerd"]  # some clients append the #
@@ -106,7 +106,7 @@ class EventProcessor:
     async def handle_event(self, data: Dict[str, Any]) -> None:
         """
         Handle individual events based on their kind.
-        Only kind 6 (Repost) currently.
+        Processes both kind 6 (Repost) and kind 7 events.
         """
         try:
             event_id = data.get('cyberherd_id')
@@ -127,9 +127,9 @@ class EventProcessor:
 
             logger.info(f"Handling event: event_id={note}, pubkey={pubkey}, kind={kind}, amount={amount}")
 
-            # Only process kind 6; all other kinds are ignored
-            if kind != 6:
-                logger.debug(f"Kind is not 6; ignoring event {note}.")
+            # Only process kind 6 and kind 7; all other kinds are ignored
+            if kind not in (6, 7):
+                logger.debug(f"Kind {kind} is not 6 or 7; ignoring event {note}.")
                 return
 
             # Skip if pubkey is the configured HEX_KEY
@@ -148,15 +148,19 @@ class EventProcessor:
             display_name = metadata.get('display_name', 'Anon')
 
             # If NIP-05 verification is enabled and nip05 is present, verify it
-            if ENABLE_NIP05_VERIFICATION and nip05:
+            if NIP05_VERIFICATION and nip05:
                 nip05 = nip05.lower().strip()
-                logger.debug(f"Processed NIP-05: '{nip05}'")
-                is_valid_nip05 = await Verifier.verify_nip05(nip05, pubkey)
-                if not is_valid_nip05:
-                    logger.error(f"Invalid NIP-05 identifier for pubkey {pubkey}: {nip05}")
-                    return  # Skip processing this event due to invalid NIP-05
-                else:
-                    logger.info(f"Valid NIP-05 identifier for pubkey {pubkey}: {nip05}")
+                logger.debug(f"Processing NIP-05: '{nip05}' for pubkey {pubkey}")
+                try:
+                    is_valid_nip05 = await Verifier.verify_nip05(nip05, pubkey)
+                    if not is_valid_nip05:
+                        logger.error(f"Invalid NIP-05 identifier for pubkey {pubkey}: {nip05}")
+                        return  # Skip processing this event due to invalid NIP-05
+                    else:
+                        logger.info(f"Valid NIP-05 identifier for pubkey {pubkey}: {nip05}")
+                except Exception as verify_exc:
+                    logger.exception(f"Exception during NIP-05 verification for pubkey {pubkey}: {nip05}", exc_info=verify_exc)
+                    return  # Optionally skip processing if verification encounters an exception
             else:
                 logger.debug("Skipping NIP-05 verification.")
 
@@ -174,8 +178,14 @@ class EventProcessor:
                 logger.debug(f"Metadata lookup success: {metadata}")
 
                 # For kind 6, set amount to 0, set default payouts
-                amount = 0
-                payouts = 0.1
+                # For kind 7, handle accordingly if needed
+                if kind == 6:
+                    amount = 0
+                    payouts = 0.1
+                elif kind == 7:
+                    # Define payouts or other fields for kind 7 if different
+                    amount = 0
+                    payouts = 0.1  # Example value; adjust as needed
 
                 json_object = {
                     "display_name": display_name,
@@ -216,10 +226,10 @@ class Monitor:
     async def execute_subprocess(self, id_output: str, created_at_output: str) -> None:
         """
         Execute a subprocess to process events asynchronously.
-        Only kind 6 (Repost) logic is handled.
+        Handles kind 6 and kind 7 events.
         """
         command = (
-            f"/usr/local/bin/nak req --stream -k 6 -e {id_output} "
+            f"/usr/local/bin/nak req --stream -k 6 -k 7 -e {id_output} "
             f"--since {created_at_output} "
             "wss://relay.damus.io wss://relay.artx.market/ wss://relay.primal.net/ ws://127.0.0.1:3002/nostrrelay/666"
         )
@@ -245,9 +255,8 @@ class Monitor:
                         pubkey = data.get('pubkey')
                         note = data.get('id')
 
-                        # Only handle kind 6
-                        if data.get('kind') == 6:
-                            logger.debug(f"Processing Repost event, ID: {note}")
+                        if data.get('kind') in (6, 7):
+                            logger.debug(f"Processing event of kind {data.get('kind')}, ID: {note}")
                             await self.event_processor.handle_event(data)
 
                     except json.JSONDecodeError as e:
@@ -266,7 +275,7 @@ class Monitor:
         """
         Monitor events and process them asynchronously.
         Focuses on any new notes that have #CyberHerd or CyberHerd tags,
-        then spawns subprocesses to fetch kind 6 events.
+        then spawns subprocesses to fetch kind 6 and kind 7 events.
         """
         midnight_today = Utils.calculate_midnight()  # Calculate timestamp for midnight today
 
@@ -297,7 +306,7 @@ class Monitor:
                         id_output = data.get('id')
                         created_at_output = data.get('created_at')
 
-                        # If this note is new, spawn a subprocess to fetch kind 6 events
+                        # If this note is new, spawn a subprocess to fetch kind 6 and 7 events
                         if id_output and created_at_output and id_output not in self.event_processor.seen_ids:
                             logger.debug(f"New note detected: {id_output}")
                             self.event_processor.seen_ids.add(id_output)
@@ -332,12 +341,6 @@ class Monitor:
                 await proc.wait()
                 self.active_subprocesses.discard(proc)
         logger.info("Monitor shutdown complete.")
-
-# -----------------------------------
-# Helper Functions
-# -----------------------------------
-
-# Removed the send_with_retry function and any @retry decorators
 
 # -----------------------------------
 # Main Function
